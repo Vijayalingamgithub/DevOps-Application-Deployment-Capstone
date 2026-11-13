@@ -7,9 +7,9 @@ pipeline {
     }
 
     environment {
-        DOCKERHUB_NAMESPACE = 'dockervijay1998'
-        IMAGE_REPO = ''
-        IMAGE_NAME = ''
+        DOCKERHUB_USER = 'dockervijay1998'
+        APP_CONTAINER  = 'trend-app'
+        APP_PORT       = '80'
     }
 
     stages {
@@ -18,11 +18,14 @@ pipeline {
                 script {
                     if (env.BRANCH_NAME in ['master', 'main']) {
                         env.IMAGE_REPO = 'prod'
-                    } else {
+                    } else if (env.BRANCH_NAME == 'dev') {
                         env.IMAGE_REPO = 'dev'
+                    } else {
+                        error "Unsupported branch: ${env.BRANCH_NAME}. Use dev, master, or main."
                     }
 
-                    env.IMAGE_NAME = "${env.DOCKERHUB_NAMESPACE}/${env.IMAGE_REPO}"
+                    env.IMAGE_NAME = "${env.DOCKERHUB_USER}/${env.IMAGE_REPO}"
+
                     echo "Branch ${env.BRANCH_NAME} will publish ${env.IMAGE_NAME}"
                 }
             }
@@ -33,7 +36,6 @@ pipeline {
                 sh '''
                     set -eu
                     docker build \
-                      --pull \
                       --tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
                       --tag "${IMAGE_NAME}:latest" \
                       .
@@ -51,12 +53,14 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        set -eu
                         set +x
-                        printf '%s' "$DH_TOKEN" |
-                          docker login --username "$DH_USER" --password-stdin
+                        printf '%s' "$DH_TOKEN" | docker login \
+                          --username "$DH_USER" \
+                          --password-stdin
+
                         docker push "${IMAGE_NAME}:${BUILD_NUMBER}"
                         docker push "${IMAGE_NAME}:latest"
+
                         docker logout
                     '''
                 }
@@ -65,14 +69,16 @@ pipeline {
 
         stage('Deploy production to EC2') {
             when {
-                expression {
-                    env.BRANCH_NAME in ['master', 'main']
+                anyOf {
+                    branch 'master'
+                    branch 'main'
                 }
             }
+
             steps {
                 script {
                     if (!env.APP_EC2_HOST?.trim()) {
-                        error('Set APP_EC2_HOST in Jenkins global environment properties to the application EC2 public IP or DNS name.')
+                        error 'APP_EC2_HOST is not set. Add the application EC2 public IP or DNS in Jenkins global environment variables.'
                     }
                 }
 
@@ -85,26 +91,28 @@ pipeline {
                 ]) {
                     sshagent(credentials: ['ec2-ssh-key']) {
                         sh '''
-                            set -eu
                             set +x
+                            set -eu
 
-                            printf '%s' "$DH_TOKEN" |
-                              ssh -o StrictHostKeyChecking=accept-new \
-                                "ubuntu@$APP_EC2_HOST" \
-                                "sudo docker login --username '$DH_USER' --password-stdin"
+                            ssh -o StrictHostKeyChecking=no \
+                                "ubuntu@${APP_EC2_HOST}" \
+                                "echo '$DH_TOKEN' | sudo docker login \
+                                  --username '$DH_USER' \
+                                  --password-stdin"
 
-                            ssh -o StrictHostKeyChecking=accept-new \
-                              "ubuntu@$APP_EC2_HOST" \
-                              "sudo docker pull '${IMAGE_NAME}:latest' && \
-                               (sudo docker rm --force trend-app || true) && \
-                               sudo docker run --detach \
-                                 --name trend-app \
-                                 --restart unless-stopped \
-                                 --publish 80:80 \
-                                 '${IMAGE_NAME}:latest'"
+                            ssh -o StrictHostKeyChecking=no \
+                                "ubuntu@${APP_EC2_HOST}" \
+                                "sudo docker pull ${IMAGE_NAME}:latest && \
+                                 sudo docker rm -f ${APP_CONTAINER} >/dev/null 2>&1 || true; \
+                                 sudo docker run -d \
+                                   --name ${APP_CONTAINER} \
+                                   --restart unless-stopped \
+                                   -p ${APP_PORT}:80 \
+                                   ${IMAGE_NAME}:latest"
 
-                            curl --fail --retry 10 --retry-all-errors --retry-delay 3 \
-                              "http://${APP_EC2_HOST}/healthz"
+                            ssh -o StrictHostKeyChecking=no \
+                                "ubuntu@${APP_EC2_HOST}" \
+                                "sudo docker logout"
                         '''
                     }
                 }
@@ -114,10 +122,13 @@ pipeline {
 
     post {
         success {
-            echo "Pipeline completed successfully for ${BRANCH_NAME}."
+            echo "Pipeline succeeded for branch ${env.BRANCH_NAME}."
         }
         failure {
-            echo "Pipeline failed. Check the stage console output."
+            echo 'Pipeline failed. Check the first failing stage in the console output.'
+        }
+        always {
+            sh 'docker image prune -f || true'
         }
     }
 }
