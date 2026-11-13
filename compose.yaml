@@ -1,0 +1,8 @@
+services:
+  app:
+    image: ${APP_IMAGE:-devops-build:local}
+    build:
+      context: .
+    ports:
+      - "80:80"
+    restart: unless-stopped
