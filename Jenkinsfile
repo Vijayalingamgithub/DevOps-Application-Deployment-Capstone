@@ -5,7 +5,7 @@ pipeline {
         stage('Build and push image') {
             steps {
                 script {
-                    def imageRepo = (env.BRANCH_NAME == 'main')
+                    def imageRepo = (env.BRANCH_NAME == 'master' || env.BRANCH_NAME == 'main')
                         ? 'dockervijay1998/prod'
                         : 'dockervijay1998/dev'
 
