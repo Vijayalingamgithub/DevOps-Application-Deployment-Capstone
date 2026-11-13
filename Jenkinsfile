@@ -1,54 +1,63 @@
 pipeline {
     agent any
 
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
     environment {
-        DOCKERHUB_USER = 'dockervijay1998'
-        EC2_HOST       = 'REPLACE_WITH_CURRENT_EC2_PUBLIC_IP'
+        DOCKERHUB_NAMESPACE = 'dockervijay1998'
+        IMAGE_REPO = ''
+        IMAGE_NAME = ''
     }
 
     stages {
         stage('Select image repository') {
             steps {
                 script {
-                    def repoName = (env.BRANCH_NAME in ['master', 'main']) ? 'prod' : 'dev'
-                    env.IMAGE_REPO = "${env.DOCKERHUB_USER}/${repoName}"
-                    echo "Branch ${env.BRANCH_NAME} will publish ${env.IMAGE_REPO}"
+                    if (env.BRANCH_NAME in ['master', 'main']) {
+                        env.IMAGE_REPO = 'prod'
+                    } else {
+                        env.IMAGE_REPO = 'dev'
+                    }
+
+                    env.IMAGE_NAME = "${env.DOCKERHUB_NAMESPACE}/${env.IMAGE_REPO}"
+                    echo "Branch ${env.BRANCH_NAME} will publish ${env.IMAGE_NAME}"
                 }
             }
         }
 
         stage('Build image') {
             steps {
-                powershell '''
-                    $repo = $env:IMAGE_REPO
-                    $tag = $env:BUILD_NUMBER
-
-                    docker build --pull `
-                        --tag "${repo}:latest" `
-                        --tag "${repo}:${tag}" .
-
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                sh '''
+                    set -eu
+                    docker build \
+                      --pull \
+                      --tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                      --tag "${IMAGE_NAME}:latest" \
+                      .
                 '''
             }
         }
 
         stage('Push image to Docker Hub') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'DH_USER',
-                    passwordVariable: 'DH_TOKEN'
-                )]) {
-                    powershell '''
-                        $token = $env:DH_TOKEN.Trim()
-                        $token | docker login --username $env:DH_USER --password-stdin
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-                        docker push "$($env:IMAGE_REPO):latest"
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-                        docker push "$($env:IMAGE_REPO):$($env:BUILD_NUMBER)"
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        printf '%s' "$DH_TOKEN" |
+                          docker login --username "$DH_USER" --password-stdin
+                        docker push "${IMAGE_NAME}:${BUILD_NUMBER}"
+                        docker push "${IMAGE_NAME}:latest"
+                        docker logout
                     '''
                 }
             }
@@ -56,38 +65,48 @@ pipeline {
 
         stage('Deploy production to EC2') {
             when {
-                anyOf {
-                    branch 'master'
-                    branch 'main'
+                expression {
+                    env.BRANCH_NAME in ['master', 'main']
                 }
             }
             steps {
+                script {
+                    if (!env.APP_EC2_HOST?.trim()) {
+                        error('Set APP_EC2_HOST in Jenkins global environment properties to the application EC2 public IP or DNS name.')
+                    }
+                }
+
                 withCredentials([
                     usernamePassword(
                         credentialsId: 'dockerhub-creds',
                         usernameVariable: 'DH_USER',
                         passwordVariable: 'DH_TOKEN'
-                    ),
-                    sshUserPrivateKey(
-                        credentialsId: 'ec2-ssh-key',
-                        keyFileVariable: 'EC2_KEY',
-                        usernameVariable: 'EC2_USER'
                     )
                 ]) {
-                    powershell '''
-                        $token = $env:DH_TOKEN.Trim()
-                        $image = "$($env:IMAGE_REPO):latest"
+                    sshagent(credentials: ['ec2-ssh-key']) {
+                        sh '''
+                            set -eu
+                            set +x
 
-                        $remoteCommand = "sudo docker rm -f devops-build-app >/dev/null 2>&1 || true; sudo docker login --username $($env:DH_USER) --password-stdin && sudo docker pull $image && sudo docker run -d --name devops-build-app --restart unless-stopped -p 80:80 $image"
+                            printf '%s' "$DH_TOKEN" |
+                              ssh -o StrictHostKeyChecking=accept-new \
+                                "ubuntu@$APP_EC2_HOST" \
+                                "sudo docker login --username '$DH_USER' --password-stdin"
 
-                        $token | & ssh.exe `
-                            -i $env:EC2_KEY `
-                            -o StrictHostKeyChecking=accept-new `
-                            "$($env:EC2_USER)@$($env:EC2_HOST)" `
-                            $remoteCommand
+                            ssh -o StrictHostKeyChecking=accept-new \
+                              "ubuntu@$APP_EC2_HOST" \
+                              "sudo docker pull '${IMAGE_NAME}:latest' && \
+                               (sudo docker rm --force trend-app || true) && \
+                               sudo docker run --detach \
+                                 --name trend-app \
+                                 --restart unless-stopped \
+                                 --publish 80:80 \
+                                 '${IMAGE_NAME}:latest'"
 
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                    '''
+                            curl --fail --retry 10 --retry-all-errors --retry-delay 3 \
+                              "http://${APP_EC2_HOST}/healthz"
+                        '''
+                    }
                 }
             }
         }
@@ -95,7 +114,7 @@ pipeline {
 
     post {
         success {
-            echo "Pipeline succeeded for ${env.BRANCH_NAME}: ${env:IMAGE_REPO}:latest"
+            echo "Pipeline completed successfully for ${BRANCH_NAME}."
         }
         failure {
             echo "Pipeline failed. Check the stage console output."
